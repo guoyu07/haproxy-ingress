@@ -43,6 +43,8 @@ type haConfig struct {
 	haHTTPSServers    []*types.HAProxyServer
 	haDefaultServer   *types.HAProxyServer
 	haproxyConfig     *types.HAProxyConfig
+	DNSResolvers      map[string]types.DNSResolver
+	DynamicCookieKeys map[string]string
 }
 
 func newControllerConfig(ingressConfig *ingress.Configuration, haproxyController *HAProxyController) *types.ControllerConfig {
@@ -51,6 +53,8 @@ func newControllerConfig(ingressConfig *ingress.Configuration, haproxyController
 	cfg.haproxyController = haproxyController
 	cfg.createUserlists()
 	cfg.createHAProxyServers()
+	cfg.createDNSResolvers()
+	cfg.createDynamicCookieKeys()
 	return &types.ControllerConfig{
 		Userlists:           cfg.userlists,
 		Servers:             cfg.ingress.Servers,
@@ -61,6 +65,8 @@ func newControllerConfig(ingressConfig *ingress.Configuration, haproxyController
 		TCPEndpoints:        cfg.ingress.TCPEndpoints,
 		UDPEndpoints:        cfg.ingress.UDPEndpoints,
 		PassthroughBackends: cfg.ingress.PassthroughBackends,
+		DNSResolvers:        cfg.DNSResolvers,
+		DynamicCookieKeys:   cfg.DynamicCookieKeys,
 		Cfg:                 newHAProxyConfig(haproxyController),
 	}
 }
@@ -144,6 +150,40 @@ func configForwardfor(conf *types.HAProxyConfig) {
 		glog.Warningf("Invalid forwardfor value option on configmap: %v. Using 'add' instead", conf.Forwardfor)
 		conf.Forwardfor = "add"
 	}
+}
+
+func (cfg *haConfig) createDynamicCookieKeys() {
+	DynamicCookieKeys := map[string]string{}
+	for _, backend := range cfg.ingress.Backends {
+		if cookieKey, ok := backend.Service.Annotations["dynamic-cookie-key"]; ok {
+			// glog.Infof("Backend %s dynamic %v\n", backend.Name, cookieKey)
+			DynamicCookieKeys[backend.Name] = cookieKey
+		}
+	}
+	cfg.DynamicCookieKeys = DynamicCookieKeys
+}
+
+func (cfg *haConfig) createDNSResolvers() {
+	// TODO: parse out multiple resolvers
+	DNSResolvers := map[string]types.DNSResolver{}
+	//glog.Infof("from config: %v", cfg.haproxyController.configMap.Data)
+	if resolvers, ok := cfg.haproxyController.configMap.Data["dns-resolver"]; ok {
+		list := strings.Split(resolvers, ":")
+		if len(list)%3 == 0 {
+			for index := 0; index < len(list)/3; index++ {
+				DNSResolvers[list[index]] = types.DNSResolver{
+					Name:                list[index],
+					IP:                  list[index+1],
+					Port:                list[index+2],
+					TimeoutRetry:        1,
+					HoldObsolete:        0,
+					ResolutionPoolSize:  0,
+					AcceptedPayloadSize: 8192,
+				}
+			}
+		}
+	}
+	cfg.DNSResolvers = DNSResolvers
 }
 
 func (cfg *haConfig) createHAProxyServers() {

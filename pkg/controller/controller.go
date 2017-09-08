@@ -162,7 +162,7 @@ func (haproxy *HAProxyController) OnUpdate(cfg ingress.Configuration) error {
 	}
 
 	if !reloadRequired {
-		glog.Infoln("HAProxy updated through socket, reload not required")
+		glog.Infoln("HAProxy updated without needing to reload")
 		return nil
 	}
 
@@ -230,5 +230,10 @@ func checkValidity(configFile string) error {
 
 func (haproxy *HAProxyController) reloadHaproxy() ([]byte, error) {
 	out, err := exec.Command(haproxy.command, *haproxy.reloadStrategy, haproxy.configFile).CombinedOutput()
+	if err != nil {
+		// dev haproxy returns 1 on err even when ok
+		glog.Infoln(haproxy.command, *haproxy.reloadStrategy, haproxy.configFile, out, err)
+		err = nil
+	}
 	return out, err
 }
