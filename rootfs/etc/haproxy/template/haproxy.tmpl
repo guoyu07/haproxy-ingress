@@ -84,6 +84,8 @@ backend {{ $backend.Name }}
 {{ if $BackendSlots.UseResolver }}
     server-template mirko-dns {{ $BackendSlots.TotalSlots }} {{$backend.Service.Name }}.{{ $backend.Service.Namespace }}.svc.cluster.local:{{ $backend.Port }} resolvers {{ $BackendSlots.UseResolver }} inter 1s check resolve-prefer ipv4
 {{ else }}
+    # server-template not used
+{{ end }}
 {{ range $target, $slot := $BackendSlots.FullSlots }}
     server {{ $slot.BackendServerName }} {{ $target }} {{ if $backend.Secure }}ssl {{ if ne $cacert.CAFileName "" }}verify required ca-file {{ $cacert.CAFileName }} {{ else }}verify none {{ end }}{{ end }}check port {{ $slot.BackendEndpoint.Port }} inter {{ $cfg.BackendCheckInterval }}{{ if eq $sticky.AffinityType "cookie" }} cookie {{ backendHash $slot.BackendServerName }}{{ end }}
 {{ end }}
