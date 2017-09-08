@@ -319,6 +319,8 @@ listen stats
 {{ end }}
     stats uri /
     no log
+    option forceclose
+    stats show-legends
 
 ######
 ###### Monitor URI
@@ -327,5 +329,3 @@ frontend healthz
     bind *:{{ $cfg.HealthzPort }}
     mode http
     monitor-uri /healthz
-    option forceclose
-    stats show-legends
