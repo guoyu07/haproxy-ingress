@@ -96,11 +96,16 @@ func reconfigureBackends(currentConfig, updatedConfig *types.ControllerConfig) b
 		updBackends := updatedConfig.Backends
 		// store BackendSlots for retrieval
 		curBackendSlots := currentConfig.BackendSlots
+		// store DNSResolvers for retrieval
+		curDNSResolvers := currentConfig.DNSResolvers
+		updDNSResolvers := updatedConfig.DNSResolvers
 
-		// exclude backend lists and slots from reflect.DeepEqual
+		// exclude backend lists, slots and DNSResolvers from reflect.DeepEqual
 		updatedConfig.Backends = []*ingress.Backend{}
 		currentConfig.Backends = updatedConfig.Backends
 		currentConfig.BackendSlots = updatedConfig.BackendSlots
+		currentConfig.DNSResolvers = map[string]types.DNSResolver{}
+		updatedConfig.DNSResolvers = map[string]types.DNSResolver{}
 
 		// check equality of everything but backends
 		if !reflect.DeepEqual(updatedConfig, currentConfig) {
@@ -119,10 +124,11 @@ func reconfigureBackends(currentConfig, updatedConfig *types.ControllerConfig) b
 				updatedConfig.BackendSlots = curBackendSlots
 				for _, backendName := range curKeys {
 					updLen := len(updBackendsMap[backendName].Endpoints)
-					totalSlots := len(curBackendSlots[backendName].EmptySlots) + len(curBackendSlots[backendName].FullSlots)
+					totalSlots := curBackendSlots[backendName].TotalSlots
 					if updLen > totalSlots || updLen < (totalSlots-updatedConfig.Cfg.BackendServerSlotsIncrement) {
 						// need to resize number of empty slots by BackendServerSlotsIncrement amount
 						reconfigureEmptySlots = true
+						glog.Infof("slot size readjustment needed for %s\n", backendName)
 					} else {
 						// everything fits so reconfigure endpoints without reloading
 						// do it with maps posing as sets
@@ -132,26 +138,32 @@ func reconfigureBackends(currentConfig, updatedConfig *types.ControllerConfig) b
 						toRemoveEndpoints := endpointsSubtract(curEndpoints, updEndpoints)
 						toAddEndpoints := endpointsSubtract(updEndpoints, curEndpoints)
 
-						// check for new/removed entries in this backend, issue socket commands
-						backendSlots := updatedConfig.BackendSlots[backendName]
-						// remove endpoints
-						for k := range toRemoveEndpoints {
-							reloadRequired = reloadRequired || !removeEndpoint(currentConfig.Cfg.StatsSocket, backendName, backendSlots.FullSlots[k].BackendServerName)
-							backendSlots.EmptySlots = append(backendSlots.EmptySlots, backendSlots.FullSlots[k].BackendServerName)
-							delete(backendSlots.FullSlots, k)
-						}
-						sort.Strings(backendSlots.EmptySlots)
-						// add endpoints
-						for k, endpoint := range toAddEndpoints {
-							// rearrange slots
-							backendSlots.FullSlots[k] = types.HAProxyBackendSlot{
-								BackendServerName: backendSlots.EmptySlots[0],
-								BackendEndpoint:   endpoint,
+						if _, ok := updBackendsMap[backendName].Service.Annotations["use-resolver"]; !ok {
+							// check for new/removed entries in this backend, issue socket commands
+							backendSlots := updatedConfig.BackendSlots[backendName]
+							// remove endpoints
+							for k := range toRemoveEndpoints {
+								reloadRequired = reloadRequired || !removeEndpoint(currentConfig.Cfg.StatsSocket, backendName, backendSlots.FullSlots[k].BackendServerName)
+								backendSlots.EmptySlots = append(backendSlots.EmptySlots, backendSlots.FullSlots[k].BackendServerName)
+								delete(backendSlots.FullSlots, k)
 							}
-							backendSlots.EmptySlots = backendSlots.EmptySlots[1:]
-							reloadRequired = reloadRequired || !addEndpoint(currentConfig.Cfg.StatsSocket, backendName, backendSlots.FullSlots[k].BackendServerName, endpoint.Address, endpoint.Port)
+							sort.Strings(backendSlots.EmptySlots)
+							// add endpoints
+							for k, endpoint := range toAddEndpoints {
+								// rearrange slots
+								backendSlots.FullSlots[k] = types.HAProxyBackendSlot{
+									BackendServerName: backendSlots.EmptySlots[0],
+									BackendEndpoint:   endpoint,
+								}
+								backendSlots.EmptySlots = backendSlots.EmptySlots[1:]
+								reloadRequired = reloadRequired || !addEndpoint(currentConfig.Cfg.StatsSocket, backendName, backendSlots.FullSlots[k].BackendServerName, endpoint.Address, endpoint.Port)
+							}
+							updatedConfig.BackendSlots[backendName] = backendSlots
+						} else {
+							if len(toRemoveEndpoints)+len(toAddEndpoints) != 0 {
+								glog.Infof("DNS used for %s\n", backendName)
+							}
 						}
-						updatedConfig.BackendSlots[backendName] = backendSlots
 					}
 				}
 			}
@@ -161,42 +173,32 @@ func reconfigureBackends(currentConfig, updatedConfig *types.ControllerConfig) b
 		updatedConfig.Backends = updBackends
 		// restore backend slots
 		currentConfig.BackendSlots = curBackendSlots
+		// restore DNSResolvers
+		currentConfig.DNSResolvers = curDNSResolvers
+		updatedConfig.DNSResolvers = updDNSResolvers
 	}
 
 	if currentConfig == nil || reconfigureEmptySlots {
-		reloadRequired = fillBackendServerSlots(currentConfig, updatedConfig)
-		//reloadRequired = true
+		fillBackendServerSlots(updatedConfig)
+		reloadRequired = true
+	} else {
+		// keep existing resolvers ResolutionPoolSize as there were no changes to it
+		for resolverName, updDNSResolver := range updatedConfig.DNSResolvers {
+			if curDNSResolver, ok := currentConfig.DNSResolvers[resolverName]; ok {
+				updDNSResolver.ResolutionPoolSize = curDNSResolver.ResolutionPoolSize
+				updatedConfig.DNSResolvers[resolverName] = updDNSResolver
+			}
+		}
 	}
 
 	return reloadRequired
 }
 
 // fill-out backends with available endpoints, add empty slots if required
-func fillBackendServerSlots(currentConfig, updatedConfig *types.ControllerConfig) bool {
+func fillBackendServerSlots(updatedConfig *types.ControllerConfig) {
 
-	reloadRequired := false
-	DNSUsed := false
-
-	curBackendsMap := map[string]*ingress.Backend{}
-	if currentConfig != nil {
-		curBackendsMap, _ = ingressBackendsRemap(currentConfig.Backends)
-	}
 	updBackendsMap, updKeys := ingressBackendsRemap(updatedConfig.Backends)
 	updatedConfig.BackendSlots = map[string]types.HAProxyBackendSlots{}
-
-	oldPoolSizes := map[string]int{}
-	// fetch DNSResolver resolution pool sizes
-	for _, DNSResolver := range updatedConfig.DNSResolvers {
-		if currentConfig != nil {
-			if curDNSResolver, ok := currentConfig.DNSResolvers[DNSResolver.Name]; ok {
-				oldPoolSizes[DNSResolver.Name] = curDNSResolver.ResolutionPoolSize
-			} else {
-				oldPoolSizes[DNSResolver.Name] = 0
-			}
-		} else {
-			oldPoolSizes[DNSResolver.Name] = 0
-		}
-	}
 
 	for _, backendName := range updKeys {
 		newBackend := types.HAProxyBackendSlots{}
@@ -206,65 +208,38 @@ func fillBackendServerSlots(currentConfig, updatedConfig *types.ControllerConfig
 			newBackend.DynamicCookieKey = cookieKey
 		}
 
-		if resolver, ok := updBackendsMap[backendName].Service.Annotations["use-resolver"]; ok {
-			// glog.Infof("%s configured resolvers %v\n", backendName, updatedConfig.DNSResolvers)
-			if DNSResolver, ok := updatedConfig.DNSResolvers[resolver]; ok {
-				DNSUsed = true
-				fullSlotCnt := len(updBackendsMap[backendName].Endpoints)
-				newBackend.TotalSlots = (int(fullSlotCnt/updatedConfig.Cfg.BackendServerSlotsIncrement) + 1) * updatedConfig.Cfg.BackendServerSlotsIncrement
-				DNSResolver.ResolutionPoolSize += newBackend.TotalSlots
-				// glog.Infof("updating resolver %s, pool size now %d\n", DNSResolver.Name, DNSResolver.ResolutionPoolSize)
-				updatedConfig.DNSResolvers[resolver] = DNSResolver
-				newBackend.UseResolver = resolver
-			} else {
-				glog.Infof("Backend %s DNSResolver %s not found, not using DNS\n", backendName, resolver)
-				newBackend.UseResolver = ""
-			}
-		}
-		if newBackend.UseResolver == "" {
-			_, ok := curBackendsMap[backendName]
-			if !ok || (ok && !reflect.DeepEqual(curBackendsMap[backendName].Endpoints, updBackendsMap[backendName].Endpoints)) {
-				reloadRequired = true
-			}
-			if updatedConfig.Cfg.DynamicScaling {
-				for i, endpoint := range updBackendsMap[backendName].Endpoints {
-					newBackend.FullSlots[fmt.Sprintf("%s:%s", endpoint.Address, endpoint.Port)] = types.HAProxyBackendSlot{
-						BackendServerName: fmt.Sprintf("server%04d", i),
-						BackendEndpoint:   &endpoint,
-					}
+		if updatedConfig.Cfg.DynamicScaling {
+			for i, endpoint := range updBackendsMap[backendName].Endpoints {
+				newBackend.FullSlots[fmt.Sprintf("%s:%s", endpoint.Address, endpoint.Port)] = types.HAProxyBackendSlot{
+					BackendServerName: fmt.Sprintf("server%04d", i),
+					BackendEndpoint:   &endpoint,
 				}
-				// add up to BackendServerSlotsIncrement empty slots
-				fullSlotCnt := len(newBackend.FullSlots)
-				extraSlotCnt := (int(fullSlotCnt/updatedConfig.Cfg.BackendServerSlotsIncrement)+1)*updatedConfig.Cfg.BackendServerSlotsIncrement - fullSlotCnt
-				for i := 0; i < extraSlotCnt; i++ {
-					newBackend.EmptySlots = append(newBackend.EmptySlots, fmt.Sprintf("server%04d", i+fullSlotCnt))
+			}
+			// add up to BackendServerSlotsIncrement empty slots
+			fullSlotCnt := len(newBackend.FullSlots)
+			totalSlotCnt := (int(fullSlotCnt/updatedConfig.Cfg.BackendServerSlotsIncrement) + 1) * updatedConfig.Cfg.BackendServerSlotsIncrement
+			extraSlotCnt := totalSlotCnt - fullSlotCnt
+			for i := 0; i < extraSlotCnt; i++ {
+				newBackend.EmptySlots = append(newBackend.EmptySlots, fmt.Sprintf("server%04d", i+fullSlotCnt))
+			}
+			newBackend.TotalSlots = totalSlotCnt
+			if resolver, ok := updBackendsMap[backendName].Service.Annotations["use-resolver"]; ok {
+				if DNSResolver, ok := updatedConfig.DNSResolvers[resolver]; ok {
+					DNSResolver.ResolutionPoolSize += newBackend.TotalSlots
+					updatedConfig.DNSResolvers[resolver] = DNSResolver
+					newBackend.UseResolver = resolver
 				}
-			} else {
-				// use addr:port as BackendServerName, don't generate empty slots
-				for _, endpoint := range updBackendsMap[backendName].Endpoints {
-					target := fmt.Sprintf("%s:%s", endpoint.Address, endpoint.Port)
-					newBackend.FullSlots[target] = types.HAProxyBackendSlot{
-						BackendServerName: target,
-						BackendEndpoint:   &endpoint,
-					}
+			}
+		} else {
+			// use addr:port as BackendServerName, don't generate empty slots
+			for _, endpoint := range updBackendsMap[backendName].Endpoints {
+				target := fmt.Sprintf("%s:%s", endpoint.Address, endpoint.Port)
+				newBackend.FullSlots[target] = types.HAProxyBackendSlot{
+					BackendServerName: target,
+					BackendEndpoint:   &endpoint,
 				}
 			}
 		}
-		// glog.Infof("backend %s reloadRequired %v\n", backendName, reloadRequired)
 		updatedConfig.BackendSlots[backendName] = newBackend
 	}
-	if DNSUsed {
-		// check if resolution pool sizes changed
-		for name, oldSize := range oldPoolSizes {
-			DNSResolver := updatedConfig.DNSResolvers[name]
-			if DNSResolver.ResolutionPoolSize != oldSize {
-				// glog.Infof("resolver %s old size %d new size %d reload required\n", name, oldSize, DNSResolver.ResolutionPoolSize)
-				reloadRequired = true
-				break
-			} /* else {
-				glog.Infof("resolver %s still same size\n", name)
-			} */
-		}
-	}
-	return reloadRequired
 }

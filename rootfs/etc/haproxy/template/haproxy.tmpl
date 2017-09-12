@@ -44,7 +44,8 @@ resolvers {{ $name }}
     nameserver ns {{ $resolver.IP }}:{{ $resolver.Port}}
     timeout retry {{ $resolver.TimeoutRetry}}s
     hold obsolete {{ $resolver.HoldObsolete}}s
-    resolution_pool_size {{ $resolver.ResolutionPoolSize }}
+    #resolution_pool_size {{ $resolver.ResolutionPoolSize }}
+    resolution_pool_size 1024
     accepted_payload_size {{ $resolver.AcceptedPayloadSize }}
 {{ end }}
 {{ end }}
@@ -82,15 +83,14 @@ backend {{ $backend.Name }}
     # CA PEM checksum: {{ $cacert.PemSHA }}
 {{ end }}
 {{ if $BackendSlots.UseResolver }}
-    server-template mirko-dns {{ $BackendSlots.TotalSlots }} {{$backend.Service.Name }}.{{ $backend.Service.Namespace }}.svc.cluster.local:{{ $backend.Port }} resolvers {{ $BackendSlots.UseResolver }} inter 1s check resolve-prefer ipv4
+    server-template server-dns {{ $BackendSlots.TotalSlots }} {{$backend.Service.Name }}.{{ $backend.Service.Namespace }}.svc.cluster.local:{{ $backend.Port }} resolvers {{ $BackendSlots.UseResolver }} inter 1s check resolve-prefer ipv4 init-addr none
 {{ else }}
-    # server-template not used
-{{ end }}
 {{ range $target, $slot := $BackendSlots.FullSlots }}
     server {{ $slot.BackendServerName }} {{ $target }} {{ if $backend.Secure }}ssl {{ if ne $cacert.CAFileName "" }}verify required ca-file {{ $cacert.CAFileName }} {{ else }}verify none {{ end }}{{ end }}check port {{ $slot.BackendEndpoint.Port }} inter {{ $cfg.BackendCheckInterval }}{{ if eq $sticky.AffinityType "cookie" }} cookie {{ backendHash $slot.BackendServerName }}{{ end }}
 {{ end }}
 {{ range $empty := $BackendSlots.EmptySlots }}
     server {{ $empty }} 127.0.0.1:81 {{ if $backend.Secure }}ssl {{ if ne $cacert.CAFileName "" }}verify required ca-file {{ $cacert.CAFileName }} {{ else }}verify none {{ end }}{{ end }}check disabled inter {{ $cfg.BackendCheckInterval }}{{ if eq $sticky.AffinityType "cookie" }} cookie {{ backendHash $empty }}{{ end }}
+{{ end }}
 {{ end }}
 {{ end }}
 
