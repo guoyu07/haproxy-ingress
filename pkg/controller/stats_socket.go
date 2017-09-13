@@ -107,6 +107,18 @@ func reconfigureBackends(currentConfig, updatedConfig *types.ControllerConfig) b
 		currentConfig.DNSResolvers = map[string]types.DNSResolver{}
 		updatedConfig.DNSResolvers = map[string]types.DNSResolver{}
 
+		// exclude ingress changes from comparisons (possibly not a good idea)
+		for _, Server := range currentConfig.Servers {
+			for _, Location := range Server.Locations {
+				Location.Ingress = nil
+			}
+		}
+		for _, Server := range updatedConfig.Servers {
+			for _, Location := range Server.Locations {
+				Location.Ingress = nil
+			}
+		}
+
 		// check equality of everything but backends
 		if !reflect.DeepEqual(updatedConfig, currentConfig) {
 			reconfigureEmptySlots = true
